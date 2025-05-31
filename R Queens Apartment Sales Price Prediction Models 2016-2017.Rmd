@@ -1,0 +1,607 @@
+---
+title: "Queens Apartment Sales Price Models 2016-2017"
+author: "Daniel Shadock"
+date: "2025-06-01"
+---
+
+# Packages/Libraries Setup
+```{r,set.seed(342)}
+#Set cache for seed
+knitr::opts_chunk$set(cache = T)
+#Memory allocation for Java ~10gb and Garbage Collection
+options(java.parameters = c("-XX:+UseConcMarkSweepGC", "-Xmx10000m"))
+#Packages to load
+pacman::p_load(
+  ggplot2,
+  tidyverse,
+  data.table,
+  R.utils,
+  magrittr,
+  dplyr,
+  testthat,
+  lubridate,
+  missForest,
+  parallel,
+  doParallel,
+  caret,
+  glmnet 
+)
+library(rJava)
+gc()
+.jinit()
+```
+
+# Data Import
+```{r}
+
+#Read in housing data file
+library(readr)
+raw_housing_data = read_csv("housing_data_2016_2017.csv")
+
+# View(raw_housing_data)
+skimr::skim(raw_housing_data)
+
+```
+
+# Data Preparation
+```{r}
+
+housing_data = data.table(raw_housing_data)
+
+# Dropping columns with all NA's
+
+na_cols = names(housing_data)[sapply(housing_data, function(x) all(is.na(x)))]
+if (length(na_cols) > 0) {
+  cat("Dropping columns with all NA values:\n")
+  print(na_cols)
+  housing_data[, (na_cols) := NULL]
+}
+
+# Drop known metadata columns
+
+drop_cols = c(
+  "url", "URL", "model_type", "HITTypeId", "HITId", "CreationTime", "AssignmentDurationInSeconds", "RequesterAnnotation", "WorkTimeInSeconds", "WorkerId", "AutoApprovalDelayInSeconds", "AssignmentId", "AssignmentStatus", "SubmitTime", "AutoApprovalTime", "Expiration", "MaxAssignments", "AcceptTime", "Description", "ApprovalTime", "Reward", "Title")
+drop_cols = intersect(drop_cols, names(housing_data))  # Drop only existing
+if (length(drop_cols) > 0) {
+  cat("Dropping known irrelevant columns:\n")
+  print(drop_cols)
+  housing_data[, (drop_cols) := NULL]
+}
+
+names(housing_data)
+
+housing_data_tbl = as_tibble(housing_data)
+skimr::skim(housing_data_tbl)
+
+# table(housing_data_tbl$community_district_num)
+# housing_data_tbl$listing_price_to_nearest_1000
+
+```
+
+# Data Cleaning I (Errors, Duplicates, Outliers Handling)
+```{r}
+
+library(tidyverse)
+
+# Clean extra characters ($ , etc.) from numerical data
+housing_data_tbl = housing_data_tbl %>%
+  mutate(across(c(common_charges, maintenance_cost, parking_charges, total_taxes, listing_price_to_nearest_1000, sale_price), readr::parse_number))
+
+housing_data_tbl = housing_data_tbl %>%
+  mutate(approx_year_built = as.integer(approx_year_built))
+
+#  Converting addresses to just zip codes for less noise and correcting known errors
+
+zip_fixes = c(
+  "138-35 Elder Ave,  Flushing NY, 1135" = "11355",
+  "32-42 89th St,  E. Elmhurst NY, 1136" = "11369",
+  "34-30 78th St,  Jackson Heights NY, 1137" = "11375",
+  "35-25 77 St,  Jackson Heights NY, 1137" = "11375",
+  "61-20 Grand Central Pky,  Forest Hills NY, 11375" = "11355",
+  "78-07 Springfield Blvd,  Bayside NY, 1136" = "11364",
+  "80-35 Springfield Blvd,  Queens Village NY, 11429" = "11355",
+  "35-25 77 St,  Jackson Heights NY, 1137" = "11372",
+  "80-35 Springfield Blvd,  Queens Village NY, 1142" = "11429"
+)
+
+housing_data_tbl = housing_data_tbl %>%
+  mutate(full_address_or_zip_code = recode(full_address_or_zip_code, !!!zip_fixes)) %>%
+  mutate(zip_code = stringr::str_extract(full_address_or_zip_code, "\\b\\d{5}\\b")) %>%
+  select(-full_address_or_zip_code) %>%
+  mutate(zip_code = as.integer(zip_code))
+
+# housing_data_tbl$zip_code
+# housing_data_tbl %>%
+#   distinct(kitchen_type)
+
+# Consolidation of data entry values
+housing_data_tbl = housing_data_tbl %>%
+  mutate(
+    cats_allowed = recode(cats_allowed, "y" = "yes"),
+    dogs_allowed = recode(dogs_allowed, "yes89" = "yes"),
+    dining_room_type = recode(dining_room_type, "yes89" = "yes", "dining area" = "other", "none" = "other"),
+    fuel_type = recode(fuel_type, 
+      "Other" = "other", "none" = "other"),
+    kitchen_type = recode(kitchen_type,
+      "eat in" = "eat-in", "Eat In" = "eat-in", "Eat in" = "eat-in",
+      "eatin" = "eat-in", "efficiency kitchene" = "efficiency",
+      "efficiency kitchen" = "efficiency", "efficiemcy" = "efficiency",
+      "efficiency ktchen" = "efficiency", "Combo" = "combo",
+      "1955" = NA_character_, "none" = NA_character_,
+    ),
+    garage_exists = recode(garage_exists,
+      "Underground" = "yes", "UG" = "yes", "underground" = "yes",
+      "Yes" = "yes", "eys" = "yes", "1" = "yes"
+    )
+  )
+
+# Checking recoded values
+# str(
+#   housing_data_tbl %>%
+#     select(cats_allowed, dogs_allowed, dining_room_type, fuel_type, kitchen_type, garage_exists, coop_condo) %>%
+#     lapply(unique)
+# )
+# 
+# housing_data_tbl %>%
+#   count(fuel_type)
+
+```
+
+# Data Manipulation (Featurization)
+```{r}
+
+# Factorizing cleaned features: cats_allowed, dogs_allowed, coop_condo, dining_room_type, fuel_type, garage_exists, kitchen_type
+housing_data_tbl = housing_data_tbl %>%
+  mutate(across(
+    c(cats_allowed, dogs_allowed, coop_condo, dining_room_type,
+      fuel_type, garage_exists, kitchen_type),
+    as.factor
+  ))
+
+# combine num_full_bathrooms and num_half_bathrooms for a new variable of num_bathroom
+housing_data_tbl = housing_data_tbl %>%
+  mutate(
+    num_full_bathrooms = replace_na(num_full_bathrooms, 0),
+    num_half_bathrooms = replace_na(num_half_bathrooms, 0),
+    num_total_bathrooms = num_full_bathrooms + (num_half_bathrooms / 2),
+    num_total_bathrooms = na_if(num_total_bathrooms, 0)  # change 0 to NA
+  ) %>%
+  select(-num_full_bathrooms, -num_half_bathrooms)
+
+# housing_data_tbl %>%
+#   count(num_total_bathrooms)
+
+# multiply listing_price_to_nearest_1000 by 1000 so that sale price shares the same unit (USD)
+housing_data_tbl = housing_data_tbl %>%
+  mutate(listing_price = listing_price_to_nearest_1000 * 1000) %>%
+  select(-listing_price_to_nearest_1000)
+
+# age of apartment
+housing_data_tbl = housing_data_tbl %>%
+  mutate(age_of_apt = 2017 - approx_year_built) %>%
+  select(-approx_year_built)
+
+# Removed LifetimeApprovalRate, Last30DaysApprovalRate, Last7DaysApprovalRate since they are all 100%
+housing_data_tbl = housing_data_tbl %>%
+  select(-LifetimeApprovalRate, -Last30DaysApprovalRate, -Last7DaysApprovalRate)
+
+# Collapsing zip code and community_district_num factors with rare data
+
+# housing_data_tbl %>%
+#   count(community_district_num)
+housing_data_tbl %>%
+  count(zip_code)
+
+housing_data_tbl = housing_data_tbl %>%
+  mutate(across(c(community_district_num, zip_code), as.character))
+
+# Function to replace rare levels with "other" factor
+collapse_rare_levels = function(x, min_count = 20) {
+  counts = table(x)
+  rare = names(counts[counts < min_count])
+  x[x %in% rare] = "other"
+  factor(x)
+}
+
+housing_data_tbl = housing_data_tbl %>%
+  mutate(
+    community_district_num = collapse_rare_levels(community_district_num, 5),
+    zip_code = collapse_rare_levels(zip_code, min_count = 30)
+  )
+
+# Checking level counts
+# table(housing_data_tbl$community_district_num)
+# table(housing_data_tbl$zip_code)
+# table(housing_data_tbl$garage_exists)
+
+# Assume if garage exists, this would be listed as yes.  Otherwise, no.
+housing_data_tbl = housing_data_tbl %>%
+  mutate(
+    garage_exists = if_else(!is.na(garage_exists), "yes", "no"),
+    garage_exists = factor(garage_exists, levels = c("no", "yes"))
+  )
+
+# table(housing_data_tbl$date_of_sale)
+
+library(lubridate)
+
+# Group date_of_sale into sales_quarter
+
+housing_data_tbl = housing_data_tbl %>%
+  mutate(date_of_sale = mdy(date_of_sale))
+
+housing_data_tbl = housing_data_tbl %>%
+  mutate(
+    sale_quarter = case_when(
+      date_of_sale >= ymd("2016-01-01") & date_of_sale < ymd("2016-04-01") ~ "Q1 2016",
+      date_of_sale >= ymd("2016-04-01") & date_of_sale < ymd("2016-07-01") ~ "Q2 2016",
+      date_of_sale >= ymd("2016-07-01") & date_of_sale < ymd("2016-10-01") ~ "Q3 2016",
+      date_of_sale >= ymd("2016-10-01") & date_of_sale < ymd("2017-01-01") ~ "Q4 2016",
+      date_of_sale >= ymd("2017-01-01") & date_of_sale < ymd("2017-04-01") ~ "Q1 2017",
+      TRUE ~ NA_character_
+    ),
+    sale_quarter = factor(sale_quarter, levels = c("Q1 2016", "Q2 2016", "Q3 2016", "Q4 2016", "Q1 2017"))
+  )
+
+housing_data_tbl = housing_data_tbl %>%
+  select(-date_of_sale)
+
+skimr::skim(housing_data_tbl)
+
+```
+
+# Data Cleaning II (Missingness)
+```{r}
+
+# Removing feature sale_quarter since > 50% missingness
+housing_data_tbl = housing_data_tbl %>%
+  select(-sale_quarter)
+
+# Removing feature dining_room_type since > 20% missingness
+housing_data_tbl = housing_data_tbl %>%
+  select(-dining_room_type)
+
+# Removing entries with NA for zip codes (4 of 2230)
+housing_data_tbl = housing_data_tbl %>% 
+  filter(!is.na(zip_code))
+
+# Creating data.frame and adding missingness columns
+missing_cols = housing_data_tbl %>%
+  select(where(~ any(is.na(.)))) %>%
+  names()
+
+housing_data_missing_flags = housing_data_tbl %>%
+  mutate(across(all_of(missing_cols), ~ as.numeric(is.na(.)), .names = "is_missing_{.col}"))
+
+housing_data_flags_only = housing_data_missing_flags %>%
+  select(starts_with("is_missing_"))
+
+housing_data_for_impute = housing_data_tbl %>%
+  select(-any_of(names(housing_data_flags_only))) %>%
+  data.frame()
+
+# Imputing only on design features, then adding missingness back in
+housing_data_imp = missForest(housing_data_for_impute)$ximp
+housing_data_imp = cbind(housing_data_imp, housing_data_flags_only)
+
+skimr::skim(housing_data_imp)
+summary(housing_data_imp)
+
+```
+
+```{r}
+
+install.packages("ggplot2")
+install.packages("ggthemes")
+library(rsample)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(skimr)
+library(tidymodels)
+library(doParallel)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+# Design Matrix Train & Test Split
+set.seed(37)
+
+# We will now work only on those rows that have an actual sale_price for training and testing
+housing_design_matrix  = housing_data_imp %>% as_tibble() %>%
+        filter(is_missing_sale_price == 0) %>%
+        select(-is_missing_sale_price)
+
+# Considered stratified sampling on sales_price in the future
+# housing_design_matrix = housing_design_matrix %>%
+#   mutate(sale_price_strata = cut_number(sale_price, 5))
+
+# Data split for Train 60%/ Validate 20%/ Test 20%
+initial_split_obj = initial_split(housing_design_matrix, prop = 0.8)
+train_val_data = training(initial_split_obj)
+test_data = testing(initial_split_obj)
+val_split_obj = initial_split(train_val_data, prop = 0.75)
+train_data = training(val_split_obj)
+validation_data = testing(val_split_obj)
+
+train_y = train_data$sale_price
+train_X = train_data %>%
+  select(-sale_price)
+
+validation_data_y = validation_data$sale_price
+validation_data_X = validation_data %>%
+  select(-sale_price)
+
+test_data_y = test_data$sale_price
+test_data_X = test_data %>%
+  select(-sale_price)
+
+skimr::skim(train_X)
+summary(train_x$zip_code)
+
+# Creating boxplot of sales data 
+ggplot() +
+  aes(x = housing_design_matrix$sale_price) +
+  geom_boxplot() +
+  theme_economist() +  # Applying the Economist theme
+  labs(title = "2016-2017 Mainland Queens, NY Apartment Sales",
+       x = "Sale Price (USD)",
+       y="")
+fivenum(housing_design_matrix$sale_price)
+summary(housing_design_matrix)
+
+# Writing Feature Summary to Drive
+# feature_summary = skimr::skim(housing_design_matrix)
+# capture.output(feature_summary, file = "feature_summary.txt")
+# write.csv(feature_summary, "feature_summary.csv", row.names = FALSE)
+
+```
+
+
+```{r}
+
+# Export housing data feature summary
+housing_summary = skimr::skim(housing_data_imp)
+housing_summary_df = as.data.frame(housing_summary)
+# write.csv(housing_summary_df, file = "housing_summary.csv", row.names = FALSE)
+
+```
+
+
+# Linear Modeling (OLS)
+```{r}
+
+# Since OLS has no hyper-parameters, train and validation data is combined
+library(dplyr)
+train_val_data_X = bind_rows(train_X, validation_data_X)
+train_val_data_y = c(train_y, validation_data_y)
+ols_housing_model = lm(train_val_data_y ~ ., data = train_val_data_X)
+
+summary(ols_housing_model)$r.squared
+summary(ols_housing_model)$sigma
+
+ols_y_hat = predict(ols_housing_model, newdata = train_val_data_X)
+
+e = train_val_data_y - ols_y_hat
+SSE = sum(e^2)
+SST = sum((train_val_data_y - mean(train_val_data_y))^2)
+Rsq = 1 - sum(e^2) / SST
+Rsq
+RMSE = sqrt(SSE / (nrow(train_val_data) - 2))
+RMSE
+PercentDiff = (ols_y_hat - train_val_data_y) / train_val_data_y
+PredictSummary = cbind(ols_y_hat, train_val_data_y, PercentDiff)
+# write.csv(PredictSummary, file = "PredictSummary.csv", row.names = FALSE)
+
+summary_ols_model = summary(ols_housing_model)$coefficients
+# write.csv(summary_ols_model, file = "summary_ols_model.csv", row.names = TRUE)
+
+library(gt)
+library(tibble)
+
+# Table with in-sample OLS performance metrics
+ols_metrics_tbl = tibble(
+  Metric = c("SSE", "SST", "R-squared", "RMSE"),
+  Value = c(SSE, SST, Rsq, RMSE)
+)
+
+ols_metrics_tbl %>%
+  gt() %>%
+  tab_header(
+    title = "OLS Model Performance Metrics"
+  ) %>%
+  fmt_number(columns = "Value", decimals = 2)
+
+summary_ols_model %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  gt() %>%
+  tab_header(title = "OLS Coefficient Table")
+
+# Test out-of-sample performance
+ols_housing_model_test_yHats = predict(ols_housing_model,test_data_X)
+
+oosRMSE_ols_housing_model_test = sqrt(sum((test_data_y - ols_housing_model_test_yHats)^2)/length(test_data_y))
+
+SSR_ols_housing_model_oos = sum((test_data_y - ols_housing_model_test_yHats) ^ 2)
+SST_ols_housing_model_oos = sum((test_data_y - mean(test_data_y)) ^ 2)
+Rsq_ols_housing_model_oos = 1 - SSR_ols_housing_model_oos / SST_ols_housing_model_oos
+
+oosRMSE_ols_housing_model_test
+Rsq_ols_housing_model_oos
+
+```
+
+
+# Regression Tree Modeling
+```{r}
+
+install.packages(c("rpart", "rpart.plot"), dependencies = TRUE)
+library(rpart)
+library(rpart.plot)
+
+# Depth of tree was limited to 3 deep
+
+# tree_model = rpart(sale_price ~ ., data = train_val_data, method = "anova", control = rpart.control(maxdepth = 10))
+# rpart.plot(tree_model)
+
+# tree_depths = rpart:::tree.depth(as.numeric(rownames(tree_model$frame)))
+# max(tree_depths)
+
+tree_model = rpart(
+  sale_price ~ ., 
+  data = train_val_data, 
+  method = "anova", 
+  control = rpart.control(
+    maxdepth = 10,
+    minsplit = 2,
+    cp = 0.001 # complexity penalty, lower increases complexity
+  )
+)
+
+rpart.plot(tree_model, extra = 101, under = TRUE, type = 2, tweak = 1.2)
+
+# Test in-sample performance
+tree_model_train_yHats = predict(tree_model,train_val_data_X)
+insample_RMSE_RegTree = sqrt(sum((train_val_data_y - tree_model_train_yHats)^2)/length(train_val_data_y))
+insample_RMSE_RegTree
+
+SSR_tree = sum((train_val_data_y - tree_model_train_yHats)^2)
+SST_tree = sum((train_val_data_y - mean(train_val_data_y))^2)
+Rsq_tree = 1 - SSR_tree / SST_tree
+
+# Test out-of-sample performance
+tree_model_test_yHats = predict(tree_model,test_data_X)
+oosRMSE_RegTree_Test = sqrt(sum((test_data_y - tree_model_test_yHats)^2)/length(tree_model_test_yHats))
+oosRMSE_RegTree_Test
+
+SSR_test = sum((test_data_y - tree_model_test_yHats)^2)
+SST_test = sum((test_data_y - mean(test_data_y))^2)
+Rsq_tree_oos = 1 - SSR_test / SST_test
+
+PercentDiffTree = (tree_model_train_yHats - train_val_data_y)/train_val_data_y
+PredictSummaryTree = cbind(tree_model_train_yHats,train_val_data_y,PercentDiffTree)
+# write.csv(PredictSummaryTree, file = "PredictSummaryTree.csv", row.names = FALSE)
+
+```
+
+# Random Forest Modeling
+```{r}
+
+install.packages("randomForest")
+library(randomForest)
+
+# rf_model_initial = randomForest(
+#   x = train_val_data_X,
+#   y = train_val_data_y,
+#   ntree = 1000,
+#   mtry = floor(ncol(train_val_data_X) / 3),
+#   nodesize = 5,
+#   importance = TRUE
+# )
+# 
+# rf_model_initial
+
+# This initial model performed worse than the regression tree, so the parameters needed to be tuned.
+
+library(tidymodels)
+library(doParallel)
+registerDoParallel(cores = parallel::detectCores() - 1)
+install.packages("ranger")
+
+rf_spec = 
+  rand_forest(
+    mtry = tune(),
+    min_n = tune(),
+    trees = 1000
+  ) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+rf_recipe = recipe(sale_price ~ ., data = train_val_data)
+
+rf_workflow = workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(rf_recipe)
+
+rf_folds = vfold_cv(train_val_data, v = 5)
+
+# Initial grid search
+# rf_grid = grid_regular(
+#   mtry(range = c(5, 30)),
+#   min_n(range = c(2, 10)),
+#   levels = 5  # 5x5 = 25 total models
+# )
+
+# Increased grid search
+rf_grid = grid_random(
+  mtry(range = c(5, 40)),
+  min_n(range = c(2, 20)),
+  size = 20
+)
+
+rf_results = tune_grid(
+  rf_workflow,
+  resamples = rf_folds,
+  grid = rf_grid,
+  metrics = metric_set(rmse, rsq),
+  control = control_grid(save_pred = TRUE)
+)
+
+# Best model performance
+show_best(rf_results, metric = "rmse")
+autoplot(rf_results)
+
+best_rf = select_best(rf_results, metric = "rmse")
+final_rf_workflow = finalize_workflow(rf_workflow, best_rf)
+rf_model = fit(final_rf_workflow, data = train_val_data)
+
+# Test in-sample performance
+rf_model_train_yHats = predict(rf_model,train_val_data_X)
+rf_model_train_RMSE = sqrt(sum((train_val_data_y - rf_model_train_yHats)^2)/length(train_val_data_y))
+
+SSR_rf_model = sum((train_val_data_y - rf_model_train_yHats) ^ 2)
+SST_rf_model = sum((train_val_data_y - mean(train_val_data_y)) ^ 2)
+Rsq_rf_model = 1 - SSR_rf_model / SST_rf_model
+RMSE_rf_model = sqrt(sum((train_val_data_y - rf_model_train_yHats)^2) / length(train_val_data_y))
+
+RMSE_rf_model
+Rsq_rf_model
+
+# Test out-of-sample performance
+rf_model_test_yHats = predict(rf_model,test_data_X)
+
+oosRMSE_rf_model_test = sqrt(sum((test_data_y - rf_model_test_yHats)^2)/length(test_data_y))
+
+SSR_rf_model_oos = sum((test_data_y - rf_model_test_yHats) ^ 2)
+SST_rf_model_oos = sum((test_data_y - mean(test_data_y)) ^ 2)
+Rsq_rf_model_oos = 1 - SSR_rf_model_oos / SST_rf_model_oos
+
+oosRMSE_rf_model_test
+Rsq_rf_model_oos
+
+```
+
+# Summary of Model Performance in and out of sample
+
+```{r}
+library(dplyr)
+library(gt)
+library(tibble)
+
+model_performance_tbl = tibble(
+  Model = c("OLS", "Regression Tree", "Random Forest"),
+  RMSE_Train = c(RMSE, insample_RMSE_RegTree, rf_model_train_RMSE),
+  R2_Train = c(Rsq, Rsq_tree, Rsq_rf_model),
+  RMSE_Test = c(oosRMSE_ols_housing_model_test, oosRMSE_RegTree_Test, oosRMSE_rf_model_test),
+  R2_Test = c(Rsq_ols_housing_model_oos, Rsq_tree_oos, Rsq_rf_model_oos)
+) %>%
+  gt() %>%
+  tab_header(title = "Model Performance Summary")
+
+model_performance_tbl
+
+# write.csv(model_performance_tbl, "model_performance_summary.csv", row.names = FALSE)
+
+```
+
+
+
