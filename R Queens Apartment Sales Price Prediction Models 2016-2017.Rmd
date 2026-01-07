@@ -335,7 +335,7 @@ test_data_X = test_data %>%
   select(-sale_price)
 
 skimr::skim(train_X)
-summary(train_x$zip_code)
+summary(train_X$zip_code)
 
 # Creating boxplot of sales data 
 ggplot() +
@@ -602,6 +602,5 @@ model_performance_tbl
 # write.csv(model_performance_tbl, "model_performance_summary.csv", row.names = FALSE)
 
 ```
-
 
 
